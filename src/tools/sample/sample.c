@@ -52,10 +52,17 @@ Abstract:
 #include "msquic.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 #ifndef UNREFERENCED_PARAMETER
 #define UNREFERENCED_PARAMETER(P) (void)(P)
 #endif
+
+// 定义重放数据格式（每个包：4字节长度 + 4字节间隔微秒）
+typedef struct {
+    uint32_t Length;
+    uint32_t IntervalUs;
+} ReplayEntry;
 
 //
 // The (optional) registration configuration for the app. This sets a name for
@@ -736,6 +743,57 @@ ClientStreamCallback(
 }
 
 void
+ClientReplay(
+    _In_ HQUIC Connection,
+    _In_ const char* ReplayFilePath
+) {
+    FILE* File = fopen(ReplayFilePath, "rb");
+    if (File == NULL) {
+        printf("Failed to open replay file: %s\n", ReplayFilePath);
+        return;
+    }
+
+    HQUIC Stream = NULL;
+    QUIC_STATUS Status;
+    if (QUIC_FAILED(Status = MsQuic->StreamOpen(Connection, QUIC_STREAM_OPEN_FLAG_NONE, ClientStreamCallback, NULL, &Stream))) {
+        printf("StreamOpen failed, 0x%x!\n", Status);
+        fclose(File);
+        return;
+    }
+    MsQuic->StreamStart(Stream, QUIC_STREAM_START_FLAG_NONE);
+
+    ReplayEntry Entry;
+    uint32_t Count = 0;
+    while (fread(&Entry, sizeof(ReplayEntry), 1, File) == 1) {
+        // 1. 模拟间隔
+        if (Entry.IntervalUs > 0) {
+            usleep(Entry.IntervalUs);
+        }
+
+        // 2. 构造 Buffer (结构体 + 数据区)
+        void* Raw = malloc(sizeof(QUIC_BUFFER) + Entry.Length);
+        if (Raw == NULL) break;
+
+        QUIC_BUFFER* Buffer = (QUIC_BUFFER*)Raw;
+        Buffer->Buffer = (uint8_t*)Raw + sizeof(QUIC_BUFFER);
+        Buffer->Length = Entry.Length;
+        memset(Buffer->Buffer, 'A', Entry.Length); 
+
+        // 3. 发送 (Context 传 Raw 指针以便在回调中 free)
+        Status = MsQuic->StreamSend(Stream, Buffer, 1, QUIC_SEND_FLAG_NONE, Raw);
+        if (QUIC_FAILED(Status)) {
+            free(Raw);
+            break;
+        }
+        if (++Count % 100 == 0) printf("Replayed %u packets\n", Count);
+    }
+
+    MsQuic->StreamShutdown(Stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
+    fclose(File);
+    printf("Replay finished. Total: %u\n", Count);
+}
+
+void
 ClientSend(
     _In_ HQUIC Connection
     )
@@ -826,8 +884,8 @@ ClientConnectionCallback(
         //
         // The handshake has completed for the connection.
         //
-        printf("[conn][%p] Connected\n", Connection);
-        ClientSend(Connection);
+        const char* ReplayFile = (const char*)Context; 
+        ClientReplay(Connection, ReplayFile);
         break;
     case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT:
         //
@@ -939,6 +997,12 @@ RunClient(
     _In_reads_(argc) _Null_terminated_ char* argv[]
     )
 {
+    // 1. 在函数开头获取文件路径
+    const char* ReplayFile = GetValue(argc, argv, "file");
+    if (ReplayFile == NULL) {
+        printf("Must specify '-file' argument for replay!\n");
+        return;
+    }
     //
     // Load the client configuration based on the "unsecure" command line option.
     //
@@ -954,7 +1018,7 @@ RunClient(
     //
     // Allocate a new connection object.
     //
-    if (QUIC_FAILED(Status = MsQuic->ConnectionOpen(Registration, ClientConnectionCallback, NULL, &Connection))) {
+    if (QUIC_FAILED(Status = MsQuic->ConnectionOpen(Registration, ClientConnectionCallback, (void*)ReplayFile, &Connection))) {
         printf("ConnectionOpen failed, 0x%x!\n", Status);
         goto Error;
     }
